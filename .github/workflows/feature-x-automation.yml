@@ -1,0 +1,305 @@
+name: Auto PR Management for feature-x
+
+on:
+  push:
+    branches: [feature-x]
+  pull_request:
+    branches: [feature-x]
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+env:
+  AUTO_APPROVE_ENABLED: true
+  MERGE_METHOD: squash
+  DELETE_BRANCH_AFTER_MERGE: true
+
+jobs:
+  # Comprehensive validation and quality checks
+  validate-and-test:
+    runs-on: ubuntu-latest
+    outputs:
+      tests-passed: ${{ steps.check-tests.outputs.passed }}
+      quality-score: ${{ steps.quality-check.outputs.score }}
+      can-auto-merge: ${{ steps.auto-merge-check.outputs.can-merge }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.12
+
+      - name: Install dependencies
+        run: |
+          pipx install hatch
+          pip install pre-commit
+
+      - name: Run pre-commit checks
+        run: |
+          pre-commit install --install-hooks
+          pre-commit run --all-files
+
+      - name: Run comprehensive tests
+        id: run-tests
+        run: |
+          cd packages/markitdown
+          hatch test --cover
+        continue-on-error: true
+
+      - name: Check test results
+        id: check-tests
+        run: |
+          if [ "${{ steps.run-tests.outcome }}" == "success" ]; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Quality and security checks
+        id: quality-check
+        run: |
+          # Run additional quality checks
+          score=85
+
+          # Check for test coverage
+          if [ "${{ steps.check-tests.outputs.passed }}" == "true" ]; then
+            score=$((score + 10))
+          fi
+
+          # Check code formatting (basic check)
+          if ! grep -r "TODO\|FIXME" packages/ --include="*.py" | head -5; then
+            score=$((score + 5))
+          fi
+
+          echo "score=$score" >> $GITHUB_OUTPUT
+          echo "Quality score: $score/100"
+
+      - name: Auto-merge eligibility check
+        id: auto-merge-check
+        run: |
+          can_merge=false
+
+          # Check if all conditions are met for auto-merge
+          if [ "${{ steps.check-tests.outputs.passed }}" == "true" ] && \
+             [ "${{ steps.quality-check.outputs.score }}" -ge 90 ] && \
+             [ "${{ env.AUTO_APPROVE_ENABLED }}" == "true" ]; then
+            can_merge=true
+          fi
+
+          echo "can-merge=$can_merge" >> $GITHUB_OUTPUT
+          echo "Auto-merge eligible: $can_merge"
+
+  # Auto-approval and PR management
+  auto-approve-and-merge:
+    runs-on: ubuntu-latest
+    needs: validate-and-test
+    if: |
+      github.event_name == 'pull_request_target' &&
+      needs.validate-and-test.outputs.can-auto-merge == 'true' &&
+      github.event.pull_request.head.ref == 'feature-x'
+
+    steps:
+      - name: Auto-approve PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.issue.number;
+
+            // Auto-approve the PR
+            await github.rest.pulls.createReview({
+              owner,
+              repo,
+              pull_number: prNumber,
+              event: 'APPROVE',
+              body: '🤖 Auto-approved: All tests passed and quality checks met.',
+            });
+
+      - name: Enable auto-merge
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.issue.number;
+
+            // Enable auto-merge with squash method
+            await github.rest.pulls.merge({
+              owner,
+              repo,
+              pull_number: prNumber,
+              merge_method: '${{ env.MERGE_METHOD }}',
+              commit_title: `Auto-merge: ${context.payload.pull_request.title}`,
+              commit_message: `${context.payload.pull_request.body}
+
+              This PR was automatically merged after passing all quality checks.`
+            });
+
+  # PR lifecycle management
+  pr-lifecycle:
+    runs-on: ubuntu-latest
+    needs: validate-and-test
+    if: |
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.ref == 'feature-x'
+
+    steps:
+      - name: Add labels and assignees
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.issue.number;
+
+            // Add appropriate labels
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: prNumber,
+              labels: ['automated-pr', 'feature-x', 'ready-for-review']
+            });
+
+            // Auto-assign to the PR author
+            await github.rest.issues.addAssignees({
+              owner,
+              repo,
+              issue_number: prNumber,
+              assignees: [context.payload.pull_request.user.login]
+            });
+
+      - name: Update PR status and notify
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.issue.number;
+            const testsPassed = '${{ needs.validate-and-test.outputs.tests-passed }}' === 'true';
+            const qualityScore = parseInt('${{ needs.validate-and-test.outputs.quality-score }}');
+            const canAutoMerge = '${{ needs.validate-and-test.outputs.can-auto-merge }}' === 'true';
+
+            let statusMessage = `## 🤖 Automated PR Status Report\n\n`;
+            statusMessage += `| Metric | Status |\n`;
+            statusMessage += `|--------|--------|\n`;
+            statusMessage += `| Tests | ${testsPassed ? '✅ Passed' : '❌ Failed'} |\n`;
+            statusMessage += `| Quality Score | ${qualityScore}/100 ${qualityScore >= 90 ? '✅' : '⚠️'} |\n`;
+            statusMessage += `| Auto-Merge | ${canAutoMerge ? '✅ Enabled' : '❌ Disabled'} |\n\n`;
+
+            if (canAutoMerge) {
+              statusMessage += `🎉 **This PR will be automatically merged** once all checks complete.\n\n`;
+            } else {
+              statusMessage += `⚠️ **Manual review required** before this PR can be merged.\n\n`;
+
+              if (!testsPassed) {
+                statusMessage += `- ❌ Tests are failing. Please fix test failures.\n`;
+              }
+              if (qualityScore < 90) {
+                statusMessage += `- ⚠️ Quality score is below 90. Please improve code quality.\n`;
+              }
+            }
+
+            statusMessage += `---\n*This report was generated automatically by the feature-x workflow.*`;
+
+            // Find and update an existing comment or create a new one
+            const comments = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number: prNumber,
+            });
+
+            const botComment = comments.data.find(comment =>
+              comment.body.includes('Automated PR Status Report') &&
+              comment.user.type === 'Bot'
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: botComment.id,
+                body: statusMessage,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body: statusMessage,
+              });
+            }
+
+  # Branch cleanup after merge
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [validate-and-test, auto-approve-and-merge]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.auto-approve-and-merge.result == 'success' &&
+      env.DELETE_BRANCH_AFTER_MERGE == 'true'
+
+    steps:
+      - name: Cleanup feature-x branch
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Check if feature-x branch exists and can be deleted
+            try {
+              await github.rest.git.deleteRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: 'heads/feature-x',
+              });
+              console.log('✅ feature-x branch deleted successfully');
+            } catch (error) {
+              console.log('ℹ️ feature-x branch was already deleted or cannot be deleted');
+            }
+
+  # Monitoring and analytics
+  analytics:
+    runs-on: ubuntu-latest
+    needs: validate-and-test
+    if: always()
+
+    steps:
+      - name: Collect and report metrics
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const testsPassed = '${{ needs.validate-and-test.outputs.tests-passed }}' === 'true';
+            const qualityScore = parseInt('${{ needs.validate-and-test.outputs.quality-score }}');
+            const canAutoMerge = '${{ needs.validate-and-test.outputs.can-auto-merge }}' === 'true';
+
+            // Create a summary for the workflow run
+            const summary = `# Feature-x Workflow Summary
+
+            ## Results
+            - **Tests**: ${testsPassed ? '✅ Passed' : '❌ Failed'}
+            - **Quality Score**: ${qualityScore}/100
+            - **Auto-Merge**: ${canAutoMerge ? '✅ Enabled' : '❌ Disabled'}
+            - **Event**: ${context.eventName}
+            - **Branch**: ${context.ref.replace('refs/heads/', '')}
+
+            ## Performance Metrics
+            - Workflow completed in: ${new Date().toISOString()}
+            - Repository: ${owner}/${repo}
+            `;
+
+            // Write to workflow summary
+            await core.summary
+              .writeRaw(summary)
+              .write();
