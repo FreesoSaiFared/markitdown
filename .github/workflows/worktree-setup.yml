@@ -1,0 +1,251 @@
+name: Worktree Management
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Worktree action'
+        required: true
+        default: 'create'
+        type: choice
+        options:
+          - create
+          - cleanup
+          - list
+          - sync
+      branch_name:
+        description: 'Branch name for worktree'
+        required: false
+        default: 'feature-x'
+      target_dir:
+        description: 'Target directory (relative to repo)'
+        required: false
+        default: '../markitdown-feature-x'
+
+jobs:
+  manage-worktrees:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Git worktree management
+        run: |
+          # Configure git for worktree operations
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+
+          echo "Current worktrees:"
+          git worktree list
+
+      - name: Create worktree
+        if: github.event.inputs.action == 'create'
+        run: |
+          BRANCH="${{ github.event.inputs.branch_name || 'feature-x' }}"
+          TARGET_DIR="${{ github.event.inputs.target_dir || '../markitdown-feature-x' }}"
+
+          echo "Creating worktree for branch: $BRANCH"
+          echo "Target directory: $TARGET_DIR"
+
+          # Check if branch exists, create if not
+          if ! git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+            echo "Creating new branch: $BRANCH"
+            git checkout -b "$BRANCH"
+            git checkout main
+          fi
+
+          # Create worktree
+          if git worktree add "$TARGET_DIR" "$BRANCH"; then
+            echo "✅ Worktree created successfully"
+            echo "Directory: $TARGET_DIR"
+            echo "Branch: $BRANCH"
+
+            # Navigate to worktree and show status
+            cd "$TARGET_DIR"
+            echo "Worktree status:"
+            git status
+            echo "Current branch: $(git branch --show-current)"
+          else
+            echo "❌ Failed to create worktree"
+            exit 1
+          fi
+
+      - name: List worktrees
+        if: github.event.inputs.action == 'list'
+        run: |
+          echo "=== Current Git Worktrees ==="
+          git worktree list
+
+          echo ""
+          echo "=== Worktree Details ==="
+          git worktree list --porcelain
+
+      - name: Cleanup worktrees
+        if: github.event.inputs.action == 'cleanup'
+        run: |
+          echo "Cleaning up worktrees for merged/removed branches..."
+
+          # Find worktrees for branches that no longer exist
+          git worktree list --porcelain | while read -r line; do
+            if [[ $line =~ ^worktree\ (.+)$ ]]; then
+              worktree_path="${BASH_REMATCH[1]}"
+              echo "Checking worktree: $worktree_path"
+
+              # Get the branch for this worktree
+              branch=$(git -C "$worktree_path" branch --show-current 2>/dev/null || echo "detached")
+
+              if [ "$branch" != "detached" ]; then
+                # Check if branch still exists
+                if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+                  echo "Removing worktree for deleted branch: $branch"
+                  git worktree remove "$worktree_path" --force
+                fi
+              fi
+            fi
+          done
+
+          echo ""
+          echo "=== Remaining Worktrees ==="
+          git worktree list
+
+      - name: Sync worktrees
+        if: github.event.inputs.action == 'sync'
+        run: |
+          echo "Syncing all worktrees..."
+
+          # Prune worktrees for deleted branches
+          git worktree prune
+
+          # Update all worktrees
+          git worktree list --porcelain | while read -r line; do
+            if [[ $line =~ ^worktree\ (.+)$ ]]; then
+              worktree_path="${BASH_REMATCH[1]}"
+              echo "Syncing worktree: $worktree_path"
+
+              # Pull latest changes in worktree
+              if [ -d "$worktree_path/.git" ]; then
+                cd "$worktree_path"
+                current_branch=$(git branch --show-current)
+
+                if [ "$current_branch" != "" ]; then
+                  echo "Updating branch: $current_branch"
+                  git fetch origin
+                  git pull origin "$current_branch" --ff-only
+                fi
+              fi
+            fi
+          done
+
+      - name: Create worktree summary
+        if: always()
+        run: |
+          echo "# Git Worktree Management Summary" > worktree-summary.md
+          echo "" >> worktree-summary.md
+          echo "**Action:** ${{ github.event.inputs.action }}" >> worktree-summary.md
+          echo "**Timestamp:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> worktree-summary.md
+          echo "**Repository:** ${{ github.repository }}" >> worktree-summary.md
+          echo "" >> worktree-summary.md
+          echo "## Current Worktrees" >> worktree-summary.md
+          echo "" >> worktree-summary.md
+          echo "\`\`\`" >> worktree-summary.md
+          git worktree list >> worktree-summary.md
+          echo "\`\`\`" >> worktree-summary.md
+
+          if [ "${{ github.event.inputs.action }}" == "create" ]; then
+            echo "" >> worktree-summary.md
+            echo "## Creation Details" >> worktree-summary.md
+            echo "- **Branch:** ${{ github.event.inputs.branch_name || 'feature-x' }}" >> worktree-summary.md
+            echo "- **Target Directory:** ${{ github.event.inputs.target_dir || '../markitdown-feature-x' }}" >> worktree-summary.md
+          fi
+
+      - name: Upload worktree summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: worktree-summary-${{ github.run_number }}
+          path: worktree-summary.md
+          retention-days: 7
+
+      - name: Create worktree issue
+        if: github.event.inputs.action == 'create' || github.event.inputs.action == 'cleanup'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const action = '${{ github.event.inputs.action }}';
+            const branch = '${{ github.event.inputs.branch_name || "feature-x" }}';
+            const targetDir = '${{ github.event.inputs.target_dir || "../markitdown-feature-x" }}';
+
+            let title, body;
+
+            if (action === 'create') {
+              title = `🌳 Worktree Created: ${branch}`;
+              body = `## Worktree Created Successfully
+
+              **Branch:** ${branch}
+              **Target Directory:** ${targetDir}
+              **Created by:** GitHub Actions
+              **Timestamp:** ${new Date().toISOString()}
+
+              ### Quick Start Commands
+
+              \`\`\`bash
+              # Navigate to worktree
+              cd ${targetDir}
+
+              # Start development
+              git status
+              git branch --show-current
+
+              # Make changes
+              # ... your changes ...
+
+              # Commit and push
+              git add .
+              git commit -m "Your changes"
+              git push origin ${branch}
+              \`\`\`
+
+              ### Notes
+              - This worktree is isolated from the main working directory
+              - Changes in this worktree don't affect other worktrees
+              - Use \`git worktree list\` to see all worktrees
+              - Use \`git worktree remove ${targetDir}\` to clean up when done
+
+              ---
+              *This was created automatically by the worktree management workflow.*
+              `;
+            } else if (action === 'cleanup') {
+              title = '🧹 Worktree Cleanup Completed';
+              body = `## Worktree Cleanup Completed
+
+              **Action:** Cleanup
+              **Completed by:** GitHub Actions
+              **Timestamp:** ${new Date().toISOString()}
+
+              ### Cleanup Actions
+              - Removed worktrees for deleted/merged branches
+              - Pruned stale worktree references
+              - Updated worktree registry
+
+              ### Current Status
+              Use \`git worktree list\` to see remaining active worktrees.
+
+              ---
+              *This was generated automatically by the worktree management workflow.*
+              `;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['worktree', 'automation', 'git']
+            });
+
+            console.log(`Worktree ${action} issue created`);

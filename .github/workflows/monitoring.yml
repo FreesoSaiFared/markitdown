@@ -1,0 +1,312 @@
+name: Workflow Monitoring and Analytics
+
+on:
+  workflow_run:
+    workflows: ["feature-x-automation", "quality-gates"]
+    types: [completed]
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
+    inputs:
+      report_type:
+        description: 'Type of report to generate'
+        required: true
+        default: 'summary'
+        type: choice
+        options:
+          - summary
+          - detailed
+          - performance
+          - failures
+
+jobs:
+  collect-metrics:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_run'
+
+    steps:
+      - name: Collect workflow metrics
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const workflowRun = context.payload.workflow_run;
+
+            // Collect basic metrics
+            const metrics = {
+              workflow_id: workflowRun.id,
+              workflow_name: workflowRun.name,
+              status: workflowRun.conclusion,
+              duration: Math.floor((new Date(workflowRun.updated_at) - new Date(workflowRun.created_at)) / 1000),
+              branch: workflowRun.head_branch,
+              event: workflowRun.event,
+              actor: workflowRun.actor.login,
+              repository: `${owner}/${repo}`,
+              timestamp: new Date().toISOString()
+            };
+
+            console.log('Workflow metrics:', JSON.stringify(metrics, null, 2));
+
+            // Store metrics in an artifact for later analysis
+            const fs = require('fs');
+            fs.writeFileSync('workflow-metrics.json', JSON.stringify(metrics, null, 2));
+
+      - name: Upload metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-metrics-${{ github.run_number }}
+          path: workflow-metrics.json
+          retention-days: 30
+
+  generate-reports:
+    runs-on: ubuntu-latest
+    needs: collect-metrics
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+
+    steps:
+      - name: Download recent metrics
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: workflow-metrics-*
+          path: ./metrics/
+          merge-multiple: true
+
+      - name: Generate analytics report
+        id: report
+        run: |
+          # Create a comprehensive analytics report
+          report_type="${{ github.event.inputs.report_type || 'summary' }}"
+
+          cat > analytics-report.md << 'EOF'
+          # Feature-x Workflow Analytics Report
+
+          **Generated:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **Report Type:** $report_type
+          **Repository:** ${{ github.repository }}
+
+          ## Summary Statistics
+
+          EOF
+
+          # Process metrics files if they exist
+          if [ -d "./metrics" ]; then
+            echo "Processing metrics files..."
+
+            # Count total workflow runs
+            total_runs=$(find ./metrics -name "*.json" | wc -l)
+            echo "- Total workflow runs analyzed: $total_runs" >> analytics-report.md
+
+            if [ "$total_runs" -gt 0 ]; then
+              # Calculate success rate
+              successful_runs=$(grep -l '"status":"success"' ./metrics/*.json 2>/dev/null | wc -l)
+              success_rate=$((successful_runs * 100 / total_runs))
+
+              echo "- Success rate: ${success_rate}%" >> analytics-report.md
+              echo "- Failed runs: $((total_runs - successful_runs))" >> analytics-report.md
+
+              # Calculate average duration
+              if command -v jq &> /dev/null; then
+                avg_duration=$(find ./metrics -name "*.json" -exec jq -r '.duration' {} \; | awk '{sum+=$1; count++} END {print int(sum/count)}')
+                echo "- Average duration: ${avg_duration}s" >> analytics-report.md
+              fi
+            fi
+          else
+            echo "No historical metrics found" >> analytics-report.md
+          fi
+
+          cat >> analytics-report.md << 'EOF'
+
+          ## Workflow Performance
+
+          ### Recent Activity
+          EOF
+
+          # Get recent workflow runs via GitHub API
+          echo "Fetching recent workflow runs..."
+          if command -v gh &> /dev/null; then
+            echo "Getting recent runs with GitHub CLI..." >> analytics-report.md
+            gh run list --workflow="feature-x-automation.yml" --limit=10 --json status,conclusion,createdAt,duration,headBranch --template '{{range .}}- {{.status}}/{{.conclusion}} on {{.headBranch}} ({{.duration}}s) - {{.createdAt}}{{"\n"}}{{end}}' >> analytics-report.md 2>/dev/null || echo "Unable to fetch recent runs" >> analytics-report.md
+          else
+            echo "GitHub CLI not available for detailed analysis" >> analytics-report.md
+          fi
+
+          cat >> analytics-report.md << 'EOF'
+
+          ## Recommendations
+
+          Based on the workflow analysis:
+
+          - 📊 Monitor success rates and address recurring failures
+          - ⚡ Optimize workflow duration where possible
+          - 🔍 Review failed runs for common patterns
+          - 🚀 Consider scaling automation based on success metrics
+
+          ---
+          *This report was generated automatically by the monitoring workflow.*
+          EOF
+
+          echo "Analytics report generated"
+          echo "report-file=analytics-report.md" >> $GITHUB_OUTPUT
+
+      - name: Create analytics issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const reportType = '${{ github.event.inputs.report_type || "summary" }}';
+            const reportFile = '${{ steps.report.outputs.report-file }}';
+
+            // Read the report content
+            const fs = require('fs');
+            let reportContent = '';
+
+            try {
+              reportContent = fs.readFileSync(reportFile, 'utf8');
+            } catch (error) {
+              reportContent = `# Analytics Report\n\nUnable to generate detailed report: ${error.message}`;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `📊 Workflow Analytics Report - ${reportType}`,
+              body: reportContent,
+              labels: ['analytics', 'monitoring', 'automated-report']
+            });
+
+            console.log('Analytics report created as issue');
+
+      - name: Upload analytics report
+        uses: actions/upload-artifact@v4
+        with:
+          name: analytics-report-${{ github.run_number }}
+          path: analytics-report.md
+          retention-days: 7
+
+  health-check:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+
+    steps:
+      - name: Repository health check
+        id: health
+        run: |
+          # Perform basic health checks
+          health_score=100
+          issues=()
+
+          echo "Performing repository health checks..."
+
+          # Check if workflows are enabled
+          if [ -d ".github/workflows" ]; then
+            workflow_count=$(ls .github/workflows/*.yml 2>/dev/null | wc -l)
+            echo "✅ Found $workflow_count workflow files"
+          else
+            health_score=$((health_score - 20))
+            issues+=("No GitHub workflows found")
+          fi
+
+          # Check for recent activity
+          if [ "$(git log --since="1 week ago" --oneline | wc -l)" -gt 0 ]; then
+            echo "✅ Recent commits found"
+          else
+            health_score=$((health_score - 10))
+            issues+=("No commits in last week")
+          fi
+
+          # Check for security configuration
+          if [ -f ".github/dependabot.yml" ]; then
+            echo "✅ Dependabot configuration found"
+          else
+            health_score=$((health_score - 15))
+            issues+=("No Dependabot configuration")
+          fi
+
+          # Convert issues to string
+          issues_str=$(IFS=", "; echo "${issues[*]}")
+
+          echo "health-score=$health_score" >> $GITHUB_OUTPUT
+          echo "issues=$issues_str" >> $GITHUB_OUTPUT
+
+          echo "=== Health Check Results ==="
+          echo "Health Score: $health_score/100"
+          if [ ${#issues[@]} -gt 0 ]; then
+            echo "Issues found: $issues_str"
+          else
+            echo "✅ All health checks passed"
+          fi
+
+      - name: Create health alert
+        uses: actions/github-script@v7
+        if: steps.health.outputs.health-score < 80
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const healthScore = parseInt('${{ steps.health.outputs.health-score }}');
+            const issues = '${{ steps.health.outputs.issues }}';
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `⚠️ Repository Health Alert - Score: ${healthScore}/100`,
+              body: `## Repository Health Check Results
+
+              **Health Score:** ${healthScore}/100
+              **Checked:** ${new Date().toISOString()}
+
+              ### Issues Found:
+              ${issues.split(', ').map(issue => `- ${issue}`).join('\n')}
+
+              ### Recommendations:
+              - Address the issues listed above to improve repository health
+              - Regular monitoring is scheduled every 6 hours
+              - Consider setting up additional automation
+
+              ---
+              *This alert was generated automatically by the monitoring workflow.*
+              `,
+              labels: ['health', 'alert', 'monitoring']
+            });
+
+            console.log(`Health alert created - Score: ${healthScore}`);
+
+  notification-cleanup:
+    runs-on: ubuntu-latest
+    if: always() && github.event_name == 'schedule'
+
+    steps:
+      - name: Cleanup old notifications
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Find and close old automated issues
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'automated-report',
+              state: 'open',
+              per_page: 50
+            });
+
+            const thirtyDaysAgo = new Date();
+            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+            let closedCount = 0;
+
+            for (const issue of issues.data) {
+              const createdDate = new Date(issue.created_at);
+              if (createdDate < thirtyDaysAgo) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed'
+                });
+                closedCount++;
+              }
+            }
+
+            console.log(`✅ Closed ${closedCount} old automated issues`);

@@ -1,0 +1,141 @@
+name: Branch Protection Management
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'setup'
+        type: choice
+        options:
+          - setup
+          - update
+          - disable
+
+jobs:
+  manage-branch-protection:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+      checks: write
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup branch protection for main
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+
+            // Configure branch protection for main branch
+            await github.rest.repos.updateBranchProtection({
+              owner,
+              repo,
+              branch: 'main',
+              required_status_checks: {
+                strict: true,
+                contexts: [
+                  'pre-commit',
+                  'tests',
+                  'validate-and-test (feature-x-automation)'
+                ]
+              },
+              enforce_admins: false,
+              required_pull_request_reviews: {
+                dismissal_restrictions: {},
+                dismiss_stale_reviews: true,
+                require_code_owner_reviews: false,
+                required_approving_review_count: 1,
+                bypass_pull_request_allowances: {
+                  users: [],
+                  teams: []
+                }
+              },
+              restrictions: null,
+              allow_force_pushes: false,
+              allow_deletions: false,
+              block_creations: true,
+              required_conversation_resolution: true,
+              lock_branch: false,
+              allow_fork_syncing: true
+            });
+
+            console.log('✅ Branch protection configured for main branch');
+
+      - name: Configure feature-x special permissions
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+
+            // For feature-x branch, we want more permissive settings for automation
+            try {
+              await github.rest.repos.updateBranchProtection({
+                owner,
+                repo,
+                branch: 'feature-x',
+                required_status_checks: {
+                  strict: false,
+                  contexts: [
+                    'pre-commit',
+                    'tests',
+                    'validate-and-test (feature-x-automation)'
+                  ]
+                },
+                enforce_admins: false,
+                required_pull_request_reviews: {
+                  dismissal_restrictions: {},
+                  dismiss_stale_reviews: false,
+                  require_code_owner_reviews: false,
+                  required_approving_review_count: 0, // Auto-approval enabled
+                  bypass_pull_request_allowances: {
+                    users: [context.actor],
+                    teams: []
+                  }
+                },
+                restrictions: null,
+                allow_force_pushes: true,
+                allow_deletions: true,
+                block_creations: false,
+                required_conversation_resolution: false,
+                lock_branch: false,
+                allow_fork_syncing: true
+              });
+
+              console.log('✅ Special branch protection configured for feature-x branch');
+            } catch (error) {
+              console.log('ℹ️ feature-x branch protection configuration skipped or already exists');
+            }
+
+      - name: Create issue if configuration fails
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Branch Protection Configuration Failed',
+              body: `The branch protection workflow failed to configure properly for repository ${context.repo.owner}/${context.repo.repo}.
+
+              **Error Details:**
+              Please check the workflow logs and manually configure branch protection if needed.
+
+              **Required Configuration:**
+              - Main branch: Require PR reviews, status checks, and conversation resolution
+              - Feature-x branch: Allow auto-approval and automation
+
+              **Workflow:** ${context.workflow}
+              **Run ID:** ${context.runId}`,
+              labels: ['bug', 'configuration', 'high-priority']
+            });
